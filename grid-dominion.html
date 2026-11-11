@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grid Dominion — Sector Warfare</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05080a; color: #c9f4ee;
+    font: 13px ui-monospace, Menlo, Consolas, monospace; user-select: none; -webkit-user-select: none; }
+  #gl, #map { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #map { pointer-events: none; }
+  body.mapmode #map { pointer-events: auto; cursor: crosshair; }
+  .hud { position: fixed; text-shadow: 0 1px 2px #000; pointer-events: none; }
+  #tl { top: 12px; left: 14px; line-height: 1.55; }
+  #tr { top: 12px; right: 14px; text-align: right; line-height: 1.55; }
+  #log { top: 12px; left: 50%; transform: translateX(-50%); text-align: center; color: #fff; }
+  #log div { transition: opacity .6s; }
+  #help { bottom: 62px; left: 50%; transform: translateX(-50%); opacity: .75; white-space: nowrap; font-size: 11px; }
+  #bar { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 8px; }
+  #bar button { font: inherit; color: #c9f4ee; background: rgba(8,30,34,.8); border: 1px solid #2c8f99; border-radius: 6px;
+    padding: 7px 12px; cursor: pointer; }
+  #bar button:hover { background: rgba(31,182,201,.3); }
+  #bar button.no { opacity: .4; }
+  #bar b { color: #ffd76a; font-weight: 600; }
+  #cross { position: fixed; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px; pointer-events: none;
+    background: linear-gradient(#c9f4ee,#c9f4ee) 50% 0/2px 7px no-repeat, linear-gradient(#c9f4ee,#c9f4ee) 50% 100%/2px 7px no-repeat,
+      linear-gradient(#c9f4ee,#c9f4ee) 0 50%/7px 2px no-repeat, linear-gradient(#c9f4ee,#c9f4ee) 100% 50%/7px 2px no-repeat; }
+  body.mapmode #cross { display: none; }
+  .meter { display: inline-block; width: 130px; height: 8px; border: 1px solid #2c8f99; vertical-align: middle; background: rgba(0,0,0,.4); }
+  .meter i { display: block; height: 100%; background: #46e0a0; }
+  #ov { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(3,8,10,.82); z-index: 5; }
+  #ov .box { max-width: 640px; padding: 26px 34px; border: 1px solid #2c8f99; background: rgba(6,22,26,.9); line-height: 1.6; }
+  #ov h1 { margin: 0 0 4px; font-size: 34px; letter-spacing: 4px; color: #6ff0ff; }
+  #ov h2 { margin: 0 0 14px; font-size: 13px; color: #ffd76a; font-weight: 600; letter-spacing: 2px; }
+  #ov kbd { color: #ffd76a; }
+  #ov .go { margin-top: 14px; color: #ffd76a; }
+  #dmg { position: fixed; inset: 0; pointer-events: none; background: radial-gradient(transparent 55%, rgba(255,40,30,.55)); opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas><canvas id="map"></canvas>
+<div id="dmg"></div><div id="cross"></div>
+<div id="tl" class="hud"></div><div id="tr" class="hud"></div><div id="log" class="hud"></div>
+<div id="help" class="hud"></div>
+<div id="bar"></div>
+<div id="ov"><div class="box" id="ovbox"></div></div>
+<script src="vendor/three.min.js"></script>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const TAU = Math.PI * 2;
+const angDiff = (a, b) => { let d = (b - a) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+// ---------- definitions ----------
+const SS = 140;                                   // sector size
+const COL = [0x70786c, 0x1fb6c9, 0xe0512f];       // neutral, player, enemy
+const CSS = ['#8a9286', '#27c6da', '#f0603c'];
+const FNAME = ['Neutral', 'Meridian', 'Ashfall'];
+const DEF = {
+  scout:   { name: 'Scout',    cost: 40,  hp: 60,   speed: 62, range: 115, dmg: 6,  rof: 0.32, r: 5,  key: '1' },
+  tank:    { name: 'Tank',     cost: 90,  hp: 190,  speed: 34, range: 150, dmg: 22, rof: 1.1,  r: 7,  key: '2' },
+  gunship: { name: 'Gunship',  cost: 140, hp: 110,  speed: 72, range: 150, dmg: 10, rof: 0.3,  r: 6,  key: '3', air: true },
+  turret:  { name: 'Turret',   cost: 70,  hp: 240,  speed: 0,  range: 195, dmg: 14, rof: 0.6,  r: 6,  key: '4' },
+  hq:      { name: 'Host Station', cost: 0, hp: 6000, speed: 0, range: 235, dmg: 30, rof: 0.4, r: 28, air: true }
+};
+const BUILDABLE = ['scout', 'tank', 'gunship', 'turret'];
+const UNIT_CAP = 30, JUMP_COST = 120;
+
+// ---------- three setup ----------
+const renderer = new THREE.WebGLRenderer({ canvas: $('gl'), antialias: true });
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9fb6c4);
+scene.fog = new THREE.Fog(0x9fb6c4, 300, 1500);
+const camera = new THREE.PerspectiveCamera(68, 1, 1, 3000);
+const mapCv = $('map'), m2 = mapCv.getContext('2d');
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  renderer.setPixelRatio(dpr); renderer.setSize(innerWidth, innerHeight, false);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  mapCv.width = innerWidth * dpr; mapCv.height = innerHeight * dpr;
+}
+addEventListener('resize', resize); resize();
+const GEO = { box: new THREE.BoxGeometry(1, 1, 1), sph: new THREE.SphereGeometry(1, 12, 8), cyl: new THREE.CylinderGeometry(1, 1, 1, 12), tile: new THREE.PlaneGeometry(SS - 3, SS - 3) };
+GEO.tile.rotateX(-Math.PI / 2);
+const lam = c => new THREE.MeshLambertMaterial({ color: c });
+const MAT = {
+  hull: [null, lam(0x3f7f8c), lam(0x8c4a3a)], trim: [null, lam(0x1fb6c9), lam(0xe0512f)], dark: lam(0x23282a),
+  bld: [lam(0x8e948b), lam(0x7fa5aa), lam(0xab8377)], glow: COL.map(c => new THREE.MeshBasicMaterial({ color: c })),
+  shot: [null, new THREE.MeshBasicMaterial({ color: 0x8ff6ff }), new THREE.MeshBasicMaterial({ color: 0xffb070 })],
+  rotor: new THREE.MeshBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.35 })
+};
+function box(mat, w, h, d, x, y, z, parent) { const m = new THREE.Mesh(GEO.box, mat); m.scale.set(w, h, d); m.position.set(x, y, z); parent.add(m); return m; }
+function cyl(mat, r, h, x, y, z, parent) { const m = new THREE.Mesh(GEO.cyl, mat); m.scale.set(r, h, r); m.position.set(x, y, z); parent.add(m); return m; }
+
+function unitMesh(type, f) {
+  const g = new THREE.Group(), H = MAT.hull[f], T = MAT.trim[f], D = MAT.dark;
+  if (type === 'scout') {
+    box(H, 5, 2, 8.5, 0, 2, 0, g); box(T, 4, 1.4, 3.5, 0, 3.5, -1, g); box(D, 0.7, 0.7, 5, 0, 3.6, 3, g);
+    for (const [x, z] of [[-3, 3], [3, 3], [-3, -3], [3, -3]]) box(D, 1.4, 2.2, 2.6, x, 1.1, z, g);
+  } else if (type === 'tank') {
+    box(D, 9, 2, 12, 0, 1, 0, g); box(H, 8, 2.2, 11, 0, 2.8, 0, g); box(T, 5, 2, 5.5, 0, 4.8, -0.5, g); box(D, 0.9, 0.9, 8, 0, 4.9, 5.5, g);
+  } else if (type === 'gunship') {
+    box(H, 4.5, 3, 9, 0, 0, 0, g); box(T, 3.2, 1.8, 3, 0, 0.8, 4, g); box(H, 1.2, 1.2, 7, 0, 0.6, -7, g); box(T, 0.6, 3, 1.6, 0, 1.8, -10, g);
+    box(D, 10, 0.5, 2, 0, -0.6, 0.5, g);
+    const r = cyl(MAT.rotor, 8, 0.2, 0, 2.4, 0, g); g.userData.rotor = r;
+  } else if (type === 'turret') {
+    cyl(D, 5, 3, 0, 1.5, 0, g); cyl(H, 3.6, 3, 0, 4.5, 0, g); box(T, 1, 1, 8, -1, 5, 4, g); box(T, 1, 1, 8, 1, 5, 4, g);
+  } else {
+    cyl(H, 28, 7, 0, 0, 0, g); cyl(D, 20, 4, 0, -5, 0, g); cyl(T, 30, 1.2, 0, 1, 0, g);
+    const dome = new THREE.Mesh(GEO.sph, MAT.trim[f]); dome.scale.set(11, 8, 11); dome.position.y = 4; g.add(dome);
+    cyl(MAT.glow[f], 5, 3, 0, -8, 0, g);
+    for (let i = 0; i < 4; i++) box(D, 3, 2, 9, Math.sin(i * TAU / 4) * 26, 3, Math.cos(i * TAU / 4) * 26, g).rotation.y = i * TAU / 4;
+  }
+  return g;
+}
+
+// ---------- state ----------
+let G = 9, WS = G * SS, level = 1, sectors = [], units = [], shots = [], booms = [];
+let energy = [0, 0, 0], income = [0, 0, 0], hq = [null, null, null];
+let ctrl = null, aimYaw = 0, aimPitch = 0, mode = 'drive', state = 'title', paused = false, T = 0;
+let sel = new Set(), tick = 0, aiT = 0, buildCool = 0, drag = null;
+const keys = {};
+const secAt = (x, z) => sectors[clamp(Math.floor(z / SS), 0, G - 1) * G + clamp(Math.floor(x / SS), 0, G - 1)];
+
+function say(t, col) {
+  const d = document.createElement('div'); d.textContent = t; if (col) d.style.color = col; $('log').prepend(d);
+  while ($('log').children.length > 4) $('log').lastChild.remove();
+  setTimeout(() => d.style.opacity = 0, 3500); setTimeout(() => d.remove(), 4200);
+}
+
+function genLevel() {
+  while (scene.children.length) scene.remove(scene.children[0]);
+  scene.add(new THREE.HemisphereLight(0xdfeeff, 0x4a5540, 0.95));
+  const sun = new THREE.DirectionalLight(0xfff2d8, 0.75); sun.position.set(0.5, 1, 0.3); scene.add(sun);
+  G = Math.min(8 + level, 13); WS = G * SS;
+  const r = rng(level * 9173 + 5);
+  sectors = []; units = []; shots = []; booms = []; sel = new Set();
+  const under = new THREE.Mesh(new THREE.PlaneGeometry(WS + 4000, WS + 4000), lam(0x2c3330)); under.rotation.x = -Math.PI / 2; under.position.set(WS / 2, -0.6, WS / 2); scene.add(under);
+  // stations: mirrored so both sides get the same chances
+  const st = new Set([1 * G + 2, (G - 2) * G + (G - 3)]);
+  let guard = 0;
+  while (st.size < 2 + 2 * Math.round(G / 3) && guard++ < 200) {
+    const i = Math.floor(r() * G), j = Math.floor(r() * G);
+    if ((i < 4 && j < 4) || (i > G - 5 && j > G - 5)) continue;
+    st.add(j * G + i); st.add((G - 1 - j) * G + (G - 1 - i));
+  }
+  for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) {
+    const owner = (i < 3 && j < 3) ? 1 : (i > G - 4 && j > G - 4) ? 2 : 0;
+    const s = { i, j, cx: (i + 0.5) * SS, cz: (j + 0.5) * SS, owner, hp: owner ? 100 : 60, station: st.has(j * G + i), blds: [], cnt: [0, 0, 0], shade: 0.82 + r() * 0.3 };
+    s.tile = new THREE.Mesh(GEO.tile, lam(0xffffff)); s.tile.position.set(s.cx, 0, s.cz); scene.add(s.tile);
+    const isHQ = (i === 1 && j === 1) || (i === G - 2 && j === G - 2);
+    if (s.station) {
+      const g = new THREE.Group(); g.position.set(s.cx, 0, s.cz);
+      cyl(MAT.dark, 13, 6, 0, 3, 0, g); cyl(MAT.bld[0], 6, 44, 0, 22, 0, g);
+      s.orb = new THREE.Mesh(GEO.sph, MAT.glow[owner]); s.orb.scale.setScalar(9); s.orb.position.y = 50; g.add(s.orb);
+      for (let k = 0; k < 3; k++) box(MAT.dark, 3, 30, 3, Math.sin(k * TAU / 3) * 16, 15, Math.cos(k * TAU / 3) * 16, g);
+      scene.add(g); s.blds.push({ x: s.cx, z: s.cz, w: 30, d: 30, h: 56, fixed: true });
+    } else if (!isHQ) {
+      const n = 1 + Math.floor(r() * 3.4);
+      for (let k = 0; k < n; k++) {
+        const w = 14 + r() * 22, d = 14 + r() * 22, h = 8 + r() * r() * 34;
+        const b = { x: s.cx + (r() - 0.5) * 80, z: s.cz + (r() - 0.5) * 80, w, d, h };
+        b.mesh = new THREE.Mesh(GEO.box, MAT.bld[owner]); b.mesh.position.set(b.x, h / 2, b.z); b.mesh.scale.set(w, h, d); scene.add(b.mesh);
+        s.blds.push(b);
+      }
+    }
+    sectors.push(s); paint(s);
+  }
+  energy = [0, 300, 80 + level * 80];
+  hq[1] = addUnit('hq', 1, 1.5 * SS, 1.5 * SS); hq[2] = addUnit('hq', 2, WS - 1.5 * SS, WS - 1.5 * SS);
+  hq[1].yaw = Math.PI / 4; hq[2].yaw = Math.PI * 1.25;
+  for (let k = 0; k < 2; k++) { spawn('tank', 1, true); spawn('scout', 1, true); }
+  for (let k = 0; k < 2 + level; k++) spawn(k % 2 ? 'scout' : 'tank', 2, true);
+  ctrl = hq[1]; aimYaw = Math.PI / 4; aimPitch = -0.35; T = 0; aiT = 2; tick = 0;
+  calcIncome();
+}
+
+function paint(s) {
+  const c = new THREE.Color(COL[s.owner]).multiplyScalar(s.owner ? 0.42 : 0.5).lerp(new THREE.Color(0x56634c), s.owner ? 0.35 : 0.6).multiplyScalar(s.shade);
+  s.tile.material.color.copy(c);
+  for (const b of s.blds) if (b.mesh) b.mesh.material = MAT.bld[s.owner];
+  if (s.orb) s.orb.material = MAT.glow[s.owner];
+}
+function capture(s, f) {
+  const old = s.owner; s.owner = f; s.hp = 35; paint(s); calcIncome();
+  if (f === 1) say(s.station ? 'Power station captured' : 'Sector captured', CSS[1]);
+  else if (old === 1) say(s.station ? 'We lost a power station!' : 'Sector lost', CSS[2]);
+}
+function calcIncome() {
+  for (const f of [1, 2]) {
+    let n = 0, st = 0; for (const s of sectors) if (s.owner === f) { n++; if (s.station) st++; }
+    const eff = st ? Math.min(1, n / (7 * st)) : 0;
+    income[f] = 1 + st * 5.5 * eff * (f === 2 ? 0.5 + level * 0.12 : 1);
+    income['n' + f] = n; income['s' + f] = st; income['e' + f] = eff;
+  }
+}
+
+function addUnit(type, f, x, z) {
+  const d = DEF[type];
+  const u = { type, def: d, fac: f, x, z, y: type === 'hq' ? 46 : d.air ? 36 : 0, yaw: rnd(0, TAU), hp: d.hp, max: d.hp, cool: rnd(0, 1), tgt: null, order: null, think: rnd(0, 0.3), dead: false, mesh: unitMesh(type, f) };
+  scene.add(u.mesh); units.push(u); return u;
+}
+function spawn(type, f, free) {
+  const d = DEF[type], h = hq[f];
+  if (!h || h.dead) return null;
+  if (!free) {
+    if (energy[f] < d.cost) { if (f === 1) say('Not enough energy'); return null; }
+    if (units.filter(u => u.fac === f && u.type !== 'hq').length >= (f === 2 ? 11 + level * 6 : UNIT_CAP)) { if (f === 1) say('Unit limit reached'); return null; }
+    energy[f] -= d.cost;
+  }
+  const a = rnd(0, TAU), rr = rnd(45, 62);
+  const u = addUnit(type, f, clamp(h.x + Math.sin(a) * rr, 8, WS - 8), clamp(h.z + Math.cos(a) * rr, 8, WS - 8));
+  u.yaw = a; boom(u.x, u.y + 3, u.z, 7, COL[f]);
+  return u;
+}
+
+function boom(x, y, z, size, color) {
+  const m = new THREE.Mesh(GEO.sph, new THREE.MeshBasicMaterial({ color: color || 0xffc070, transparent: true }));
+  m.position.set(x, y, z); scene.add(m); booms.push({ m, t: 0, size, life: 0.25 + size * 0.02 });
+}
+
+function fire(u, dx, dy, dz, mult, far) {
+  const d = u.def, sp = 330, m = new THREE.Mesh(GEO.sph, MAT.shot[u.fac]);
+  const big = d.dmg > 18 ? 1.5 : 0.9; m.scale.set(big, big, big * 3);
+  const my = u.type === 'hq' ? u.y - 9 : u.type === 'gunship' ? u.y - 1 : u.y + 4.5;
+  const s = { x: u.x + dx * (d.r + 3), y: my, z: u.z + dz * (d.r + 3), vx: dx * sp, vy: dy * sp, vz: dz * sp, life: d.range * (far || 1.2) / sp, dmg: d.dmg * (mult || 1), fac: u.fac, m };
+  m.position.set(s.x, s.y, s.z); m.lookAt(s.x + dx, s.y + dy, s.z + dz); scene.add(m); shots.push(s);
+  u.cool = d.rof;
+}
+function hurt(u, d) {
+  if (u.dead) return;
+  if (u === ctrl) { d *= 0.65; $('dmg').style.opacity = 1; setTimeout(() => $('dmg').style.opacity = 0, 120); }
+  u.hp -= d;
+  if (u.hp > 0) return;
+  u.dead = true; scene.remove(u.mesh); sel.delete(u);
+  boom(u.x, u.y + 3, u.z, u.type === 'hq' ? 90 : 16);
+  if (u.type === 'hq') { endGame(u.fac === 2); return; }
+  if (u === ctrl) { say('Vehicle destroyed — control returned to the Host Station', CSS[2]); takeControl(hq[1]); }
+}
+function endGame(win) {
+  state = win ? 'won' : 'lost'; if (document.pointerLockElement) document.exitPointerLock();
+  showOverlay(win
+    ? '<h1>SECTOR SECURED</h1><h2>THE ASHFALL HOST STATION IS DESTROYED</h2>Theatre ' + level + ' is yours.<div class="go">Press ENTER or click for theatre ' + (level + 1) + '</div>'
+    : '<h1>STATION LOST</h1><h2>YOUR HOST STATION WAS DESTROYED</h2>Reached theatre ' + level + '.<div class="go">Press ENTER or click to try again</div>');
+}
+
+// ---------- simulation ----------
+function findTarget(u) {
+  let best = null, bd = (u.def.range * 1.25) ** 2;
+  for (const o of units) {
+    if (o.dead || o.fac === u.fac) continue;
+    const d = (o.x - u.x) ** 2 + (o.z - u.z) ** 2;
+    if (d < bd) { bd = d; best = o; }
+  }
+  return best;
+}
+function clearPoint(x, z) {
+  for (const b of secAt(x, z).blds) {
+    const rr = Math.max(b.w, b.d) * 0.62 + 16, dx = x - b.x, dz = z - b.z, d = Math.hypot(dx, dz) || 1;
+    if (d < rr) { x = b.x + dx / d * rr; z = b.z + dz / d * rr; }
+  }
+  return { x: clamp(x, 8, WS - 8), z: clamp(z, 8, WS - 8) };
+}
+function collide(u) {
+  if (u.def.air) return;
+  const s = secAt(u.x, u.z);
+  for (const b of s.blds) {
+    const rr = Math.max(b.w, b.d) * 0.62 + u.def.r, dx = u.x - b.x, dz = u.z - b.z, d = Math.hypot(dx, dz);
+    if (d < rr) { const k = d > 0.01 ? rr / d : 1; u.x = b.x + (dx || 0.5) * k; u.z = b.z + (dz || 0.5) * k; }
+  }
+}
+function updateUnit(u, dt) {
+  const d = u.def;
+  u.cool -= dt;
+  if (u === ctrl && mode === 'drive') return playerDrive(u, dt);
+  u.think -= dt;
+  if (u.think <= 0) {
+    u.think = 0.3; u.tgt = findTarget(u);
+    // give up on a destination we cannot make progress towards
+    if (u.order && !u.tgt) { u.stuck = Math.hypot(u.x - (u.lx || 0), u.z - (u.lz || 0)) < 1.5 ? (u.stuck || 0) + 1 : 0; if (u.stuck > 6) { u.order = null; u.stuck = 0; } } else u.stuck = 0;
+    u.lx = u.x; u.lz = u.z;
+  }
+  const t = u.tgt && !u.tgt.dead ? u.tgt : null;
+  let moving = false, want = null;
+  if (t) {
+    const dist = Math.hypot(t.x - u.x, t.z - u.z);
+    want = Math.atan2(t.x - u.x, t.z - u.z);
+    if (dist < d.range) {
+      if (u.cool <= 0 && Math.abs(angDiff(u.yaw, want)) < 0.25) {
+        const ty = t.y + (t.type === 'hq' ? 0 : 2), my = u.type === 'hq' ? u.y - 9 : u.y + 4;
+        let dx = t.x - u.x, dy = ty - my, dz = t.z - u.z; const l = Math.hypot(dx, dy, dz) || 1, sp = 0.035;
+        fire(u, dx / l + rnd(-sp, sp), dy / l + rnd(-sp, sp), dz / l + rnd(-sp, sp));
+      }
+    } else if (!u.order && d.speed) { moving = true; }
+    if (dist < d.range * 0.85) moving = false; else if (u.order) { moving = true; want = null; }
+  } else if (u.order) moving = true;
+  if (u.order && (!t || want === null)) {
+    const ox = u.order.x - u.x, oz = u.order.z - u.z;
+    if (Math.hypot(ox, oz) < 20) { u.order = null; moving = false; } else want = Math.atan2(ox, oz);
+  }
+  if (want !== null) u.yaw += clamp(angDiff(u.yaw, want), -3 * dt, 3 * dt);
+  if (moving && d.speed && want !== null && Math.abs(angDiff(u.yaw, want)) < 0.7) {
+    u.x += Math.sin(u.yaw) * d.speed * dt; u.z += Math.cos(u.yaw) * d.speed * dt;
+  }
+  if (u.type === 'gunship') u.y += (36 - u.y) * dt;
+  u.x = clamp(u.x, 6, WS - 6); u.z = clamp(u.z, 6, WS - 6);
+  collide(u);
+}
+function playerDrive(u, dt) {
+  const d = u.def;
+  const turn = (keys.KeyA || keys.ArrowLeft ? 1 : 0) - (keys.KeyD || keys.ArrowRight ? 1 : 0);
+  aimYaw += turn * 1.9 * dt;
+  aimPitch = clamp(aimPitch + ((keys.ArrowUp ? 1 : 0) - (keys.ArrowDown ? 1 : 0)) * dt, u.type === 'hq' ? -1.1 : -0.75, u.type === 'hq' ? 0.25 : 0.6);
+  u.yaw = aimYaw;
+  if (d.speed) {
+    const mv = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 0.6 : 0), sp = d.speed * 1.2;
+    u.x += Math.sin(u.yaw) * mv * sp * dt; u.z += Math.cos(u.yaw) * mv * sp * dt;
+    if (u.type === 'gunship') u.y = clamp(u.y + ((keys.Space ? 1 : 0) - (keys.KeyC || keys.ShiftLeft ? 1 : 0)) * 34 * dt, 10, 95);
+    u.x = clamp(u.x, 6, WS - 6); u.z = clamp(u.z, 6, WS - 6); collide(u);
+  }
+  if ((keys.mouse || keys.KeyF || keys.ControlLeft) && u.cool <= 0) {
+    const c = camera.position, dir = aimDir(), my = u.type === 'hq' ? u.y - 9 : u.y + 4;
+    let dx = c.x + dir.x * 260 - u.x, dy = c.y + dir.y * 260 - my, dz = c.z + dir.z * 260 - u.z; const l = Math.hypot(dx, dy, dz);
+    fire(u, dx / l, dy / l, dz / l, 1.6, 1.7); u.cool = d.rof * 0.75;
+  }
+}
+const aimDir = () => ({ x: Math.sin(aimYaw) * Math.cos(aimPitch), y: Math.sin(aimPitch), z: Math.cos(aimYaw) * Math.cos(aimPitch) });
+
+function updateShots(dt) {
+  for (let i = shots.length - 1; i >= 0; i--) {
+    const s = shots[i]; s.life -= dt; s.x += s.vx * dt; s.y += s.vy * dt; s.z += s.vz * dt;
+    let hit = s.life <= 0 ? 1 : 0, silent = hit;
+    if (!hit && s.y <= 0) hit = 1;
+    if (!hit && s.x > 0 && s.z > 0 && s.x < WS && s.z < WS) {
+      const sec = secAt(s.x, s.z);
+      for (const b of sec.blds) {
+        const h = b.fixed ? b.h : b.h * (0.25 + 0.75 * sec.hp / 100);
+        if (s.y < h && Math.abs(s.x - b.x) < b.w / 2 && Math.abs(s.z - b.z) < b.d / 2) {
+          hit = 1;
+          if (sec.owner !== s.fac && !sec.cnt[sec.owner || 3]) { sec.hp -= s.dmg * 0.45; if (sec.hp <= 0) capture(sec, s.fac); }
+          break;
+        }
+      }
+    }
+    if (!hit) for (const u of units) {
+      if (u.dead || u.fac === s.fac) continue;
+      const rr = u.def.r + 1.5, dy = s.y - (u.y + (u.type === 'hq' ? 0 : 2.5));
+      if ((s.x - u.x) ** 2 + (s.z - u.z) ** 2 < rr * rr && Math.abs(dy) < (u.type === 'hq' ? 12 : 5)) { hit = 1; hurt(u, s.dmg); break; }
+    }
+    if (hit) { if (!silent || s.life > -1) boom(s.x, Math.max(1, s.y), s.z, silent ? 1.5 : 3 + s.dmg * 0.15); scene.remove(s.m); shots.splice(i, 1); }
+    else s.m.position.set(s.x, s.y, s.z);
+  }
+}
+
+function sectorTick(dt) {
+  for (const s of sectors) s.cnt[1] = s.cnt[2] = 0;
+  for (const u of units) if (!u.dead && u.type !== 'hq') secAt(u.x, u.z).cnt[u.fac]++;
+  for (const s of sectors) {
+    const a = s.owner === 1 ? 2 : s.owner === 2 ? 1 : (s.cnt[1] >= s.cnt[2] ? 1 : 2), n = s.cnt[a];
+    const defended = s.owner ? s.cnt[s.owner] > 0 : (s.cnt[1] > 0 && s.cnt[2] > 0);
+    if (n && !defended) { s.hp -= 3.5 * Math.min(n, 4) * dt; if (s.hp <= 0) capture(s, a); }
+    else if (s.owner && !n && s.hp < 100) s.hp = Math.min(100, s.hp + 3 * dt);
+    const k = 0.25 + 0.75 * clamp(s.hp, 0, 100) / 100;
+    for (const b of s.blds) if (b.mesh) { b.mesh.scale.y = b.h * k; b.mesh.position.y = b.h * k / 2; }
+  }
+}
+
+function enemyAI() {
+  const h = hq[2]; if (!h || h.dead) return;
+  const mine = units.filter(u => u.fac === 2 && !u.dead && u.type !== 'hq');
+  const pick = ['scout', 'tank', 'tank', 'gunship', 'scout', 'tank', 'gunship', 'turret'][Math.floor(Math.random() * 8)];
+  if (pick !== 'turret' || mine.filter(u => u.type === 'turret').length < 2 + level) if (energy[2] >= DEF[pick].cost + 20) spawn(pick, 2);
+  const threatened = units.some(u => u.fac === 1 && !u.dead && Math.hypot(u.x - h.x, u.z - h.z) < 330);
+  const grace = T < Math.max(40, 225 - level * 25), anyNeutral = sectors.some(s => !s.owner);
+  for (const u of mine) {
+    if (!u.def.speed) continue;
+    if (threatened && Math.random() < 0.5) { u.order = { x: h.x + rnd(-70, 70), z: h.z + rnd(-70, 70) }; continue; }
+    if (u.order) continue;
+    const r = Math.random(); let tx, tz;
+    if (!grace && r < 0.1 + level * 0.04 && mine.length > 7) { tx = hq[1].x; tz = hq[1].z; }
+    else {
+      let best = null, bd = 1e9;
+      for (const s of sectors) {
+        if (s.owner === 2) continue;
+        if (grace && s.owner === 1 && anyNeutral) continue;
+        let d = Math.hypot(s.cx - u.x, s.cz - u.z) * rnd(0.7, 1.3);
+        if (s.station) d *= 0.45; if (s.owner === 1) d *= 0.9;
+        if (d < bd) { bd = d; best = s; }
+      }
+      if (best && best === secAt(u.x, u.z)) { if (grace || !best.cnt[1]) continue; best = null; }   // still capturing: stay put
+      if (!best) { tx = hq[1].x; tz = hq[1].z; } else { tx = best.cx; tz = best.cz; }
+    }
+    u.order = clearPoint(tx + rnd(-38, 38), tz + rnd(-38, 38));
+  }
+}
+
+function update(dt) {
+  T += dt; buildCool -= dt;
+  for (const f of [1, 2]) energy[f] = Math.min(999, energy[f] + income[f] * dt);
+  for (const u of units) if (!u.dead) updateUnit(u, dt);
+  // separation
+  for (let i = 0; i < units.length; i++) { const a = units[i]; if (a.dead || !a.def.speed) continue;
+    for (let j = i + 1; j < units.length; j++) { const b = units[j]; if (b.dead || !b.def.speed || a.def.air !== b.def.air) continue;
+      const dx = b.x - a.x, dz = b.z - a.z, rr = a.def.r + b.def.r + 1, d2 = dx * dx + dz * dz;
+      if (d2 < rr * rr && d2 > 0.001) { const d = Math.sqrt(d2), p = (rr - d) / d * 0.5; a.x -= dx * p; a.z -= dz * p; b.x += dx * p; b.z += dz * p; } } }
+  updateShots(dt);
+  tick -= dt; if (tick <= 0) { tick = 0.25; sectorTick(0.25); units = units.filter(u => !u.dead); }
+  aiT -= dt; if (aiT <= 0) { aiT = Math.max(1.2, 4.2 - level * 0.45); enemyAI(); }
+  for (let i = booms.length - 1; i >= 0; i--) { const b = booms[i]; b.t += dt; const k = b.t / b.life;
+    if (k >= 1) { scene.remove(b.m); b.m.material.dispose(); booms.splice(i, 1); } else { b.m.scale.setScalar(b.size * (0.3 + k)); b.m.material.opacity = 1 - k; } }
+  for (const u of units) { u.mesh.position.set(u.x, u.y + (u.def.air ? Math.sin(T * 2 + u.x) * 0.6 : 0), u.z); u.mesh.rotation.y = u.yaw; if (u.mesh.userData.rotor) u.mesh.userData.rotor.rotation.y = T * 30; }
+  if (hq[1]) hq[1].mesh.rotation.y = ctrl === hq[1] ? aimYaw : hq[1].yaw;
+}
+
+function placeCamera() {
+  const u = ctrl; if (!u) return;
+  const back = u.type === 'hq' ? 78 : u.type === "gunship" ? 26 : 25, up = u.type === "hq" ? 26 : 9, d = aimDir();
+  camera.position.set(u.x - Math.sin(aimYaw) * back, Math.max(2.5, u.y + up - d.y * back * 0.6), u.z - Math.cos(aimYaw) * back);
+  camera.lookAt(camera.position.x + d.x * 100, camera.position.y + d.y * 100, camera.position.z + d.z * 100);
+}
+function takeControl(u) {
+  if (!u || u.dead || u.fac !== 1) return;
+  ctrl = u; aimYaw = u.yaw; aimPitch = u.type === 'hq' ? -0.35 : 0; u.order = null;
+}
+function hqJump(x, z) {
+  const s = secAt(x, z), h = hq[1];
+  if (s.owner !== 1) return say('The Host Station can only jump to a sector you own');
+  if (s.station) return say('Cannot park on a power station');
+  if (energy[1] < JUMP_COST) return say('Jump needs ' + JUMP_COST + ' energy');
+  energy[1] -= JUMP_COST; boom(h.x, h.y, h.z, 50, COL[1]); h.x = s.cx; h.z = s.cz; boom(h.x, h.y, h.z, 50, COL[1]); say('Host Station relocated', CSS[1]);
+}
+
+// ---------- map ----------
+function mapRect() {
+  const dpr = mapCv.width / innerWidth;
+  if (mode === 'map') { const size = Math.min(innerWidth, innerHeight - 150) * 0.94; return { x: (innerWidth - size) / 2, y: (innerHeight - 90 - size) / 2 + 16, size, dpr }; }
+  const size = Math.min(210, innerWidth * 0.26); return { x: 14, y: innerHeight - size - 14, size, dpr };
+}
+const w2m = (R, x, z) => [R.x + x / WS * R.size, R.y + (1 - z / WS) * R.size];
+const m2w = (R, mx, my) => [(mx - R.x) / R.size * WS, (1 - (my - R.y) / R.size) * WS];
+function drawMap() {
+  const R = mapRect(), c = m2; c.setTransform(R.dpr, 0, 0, R.dpr, 0, 0); c.clearRect(0, 0, innerWidth, innerHeight);
+  if (mode === 'map') { c.fillStyle = 'rgba(3,10,12,.72)'; c.fillRect(0, 0, innerWidth, innerHeight); }
+  const cs = R.size / G;
+  for (const s of sectors) {
+    const [x, y] = w2m(R, s.i * SS, (s.j + 1) * SS);
+    c.fillStyle = s.owner === 1 ? '#0f5661' : s.owner === 2 ? '#6b2717' : '#3a403a'; c.globalAlpha = (mode === 'map' ? 0.95 : 0.8) * (0.55 + 0.45 * clamp(s.hp, 0, 100) / 100);
+    c.fillRect(x + 0.5, y + 0.5, cs - 1, cs - 1); c.globalAlpha = 1;
+    if (s.station) { c.fillStyle = CSS[s.owner]; c.beginPath(); c.arc(x + cs / 2, y + cs / 2, cs * 0.2, 0, TAU); c.fill(); c.fillStyle = '#ffe36a'; c.font = '600 ' + cs * 0.3 + 'px sans-serif'; c.textAlign = 'center'; c.fillText('⚡', x + cs / 2, y + cs * 0.61); }
+  }
+  c.strokeStyle = '#2c8f99'; c.lineWidth = 1; c.strokeRect(R.x, R.y, R.size, R.size);
+  const k = mode === 'map' ? 1 : 0.6;
+  for (const u of units) {
+    if (u.dead) continue;
+    const [x, y] = w2m(R, u.x, u.z); c.fillStyle = CSS[u.fac];
+    if (u.type === 'hq') { c.beginPath(); c.arc(x, y, 9 * k, 0, TAU); c.fill(); c.strokeStyle = '#fff'; c.lineWidth = 1.5; c.stroke(); }
+    else if (u.type === 'gunship') { c.beginPath(); c.moveTo(x, y - 5 * k); c.lineTo(x + 5 * k, y + 4 * k); c.lineTo(x - 5 * k, y + 4 * k); c.fill(); }
+    else if (u.type === 'turret') { c.fillRect(x - 3 * k, y - 3 * k, 6 * k, 6 * k); c.strokeStyle = '#000'; c.lineWidth = 1; c.strokeRect(x - 3 * k, y - 3 * k, 6 * k, 6 * k); }
+    else { c.beginPath(); c.arc(x, y, (u.type === 'tank' ? 4.2 : 3) * k, 0, TAU); c.fill(); }
+    if (sel.has(u)) { c.strokeStyle = '#fff'; c.lineWidth = 1.5; c.beginPath(); c.arc(x, y, 8 * k + 2, 0, TAU); c.stroke();
+      if (u.order && mode === 'map') { const [ox, oy] = w2m(R, u.order.x, u.order.z); c.strokeStyle = 'rgba(255,255,255,.3)'; c.beginPath(); c.moveTo(x, y); c.lineTo(ox, oy); c.stroke(); } }
+    if (u === ctrl) { c.strokeStyle = '#ffe36a'; c.lineWidth = 2; c.beginPath(); c.moveTo(x, y); c.lineTo(x + Math.sin(aimYaw) * 16 * k, y - Math.cos(aimYaw) * 16 * k); c.stroke(); c.beginPath(); c.arc(x, y, 7 * k + 1, 0, TAU); c.stroke(); }
+  }
+  if (drag && drag.box) { c.strokeStyle = '#fff'; c.lineWidth = 1; c.strokeRect(drag.x0, drag.y0, drag.x1 - drag.x0, drag.y1 - drag.y0); }
+}
+function unitAtMap(mx, my) {
+  const R = mapRect(); let best = null, bd = 14;
+  for (const u of units) { if (u.dead || u.fac !== 1) continue; const [x, y] = w2m(R, u.x, u.z), d = Math.hypot(x - mx, y - my) - (u.type === 'hq' ? 6 : 0); if (d < bd) { bd = d; best = u; } }
+  return best;
+}
+function orderTo(x, z) {
+  if (x < 0 || z < 0 || x > WS || z > WS) return;
+  const list = [...sel].filter(u => !u.dead);
+  if (list.includes(hq[1])) hqJump(x, z);
+  const movers = list.filter(u => u.def.speed);
+  movers.forEach((u, i) => { const a = i * 2.4, rr = i ? 14 + 7 * Math.sqrt(i) * 2 : 0; u.order = clearPoint(x + Math.sin(a) * rr, z + Math.cos(a) * rr); });
+  if (movers.length) boom(x, 2, z, 8, COL[1]);
+}
+mapCv.addEventListener('contextmenu', e => e.preventDefault());
+mapCv.addEventListener('mousedown', e => {
+  if (mode !== 'map' || state !== 'play') return;
+  if (e.button === 2) { const [x, z] = m2w(mapRect(), e.clientX, e.clientY); orderTo(x, z); return; }
+  drag = { x0: e.clientX, y0: e.clientY, x1: e.clientX, y1: e.clientY, box: false, shift: e.shiftKey };
+});
+addEventListener('mousemove', e => {
+  if (drag) { drag.x1 = e.clientX; drag.y1 = e.clientY; if (Math.hypot(drag.x1 - drag.x0, drag.y1 - drag.y0) > 6) drag.box = true; }
+  if (document.pointerLockElement && mode === 'drive' && state === 'play') {
+    aimYaw -= e.movementX * 0.0024; const hqv = ctrl && ctrl.type === 'hq';
+    aimPitch = clamp(aimPitch - e.movementY * 0.002, hqv ? -1.1 : -0.75, hqv ? 0.25 : 0.6);
+  }
+});
+addEventListener('mouseup', e => {
+  if (e.button === 0) keys.mouse = 0;
+  if (!drag) return;
+  const R = mapRect(); if (!drag.shift) sel.clear();
+  if (drag.box) { const xa = Math.min(drag.x0, drag.x1), xb = Math.max(drag.x0, drag.x1), ya = Math.min(drag.y0, drag.y1), yb = Math.max(drag.y0, drag.y1);
+    for (const u of units) { if (u.dead || u.fac !== 1 || u.type === 'hq') continue; const [x, y] = w2m(R, u.x, u.z); if (x > xa && x < xb && y > ya && y < yb) sel.add(u); } }
+  else { const u = unitAtMap(drag.x0, drag.y0); if (u) sel.add(u); }
+  drag = null;
+});
+mapCv.addEventListener('dblclick', e => { const u = unitAtMap(e.clientX, e.clientY); if (u) { takeControl(u); setMode('drive'); } });
+$('gl').addEventListener('mousedown', e => {
+  if (state !== 'play' || mode !== 'drive') return;
+  if (!document.pointerLockElement && $('gl').requestPointerLock) { try { const p = $('gl').requestPointerLock(); if (p && p.catch) p.catch(() => {}); } catch (err) {} }
+  if (e.button === 0) keys.mouse = 1;
+});
+function setMode(m) { mode = m; document.body.classList.toggle('mapmode', m === 'map'); if (m === 'map' && document.pointerLockElement) document.exitPointerLock(); keys.mouse = 0; }
+
+addEventListener('keydown', e => {
+  if (['Tab', 'Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  keys[e.code] = 1; if (e.repeat) return;
+  if (e.code === 'Enter' && state !== 'play') return advance();
+  if (state !== 'play') return;
+  if (e.code === 'Tab' || e.code === 'KeyM') setMode(mode === 'map' ? 'drive' : 'map');
+  if (e.code === 'KeyP') paused = !paused;
+  if (e.code === 'KeyH') { takeControl(hq[1]); setMode('drive'); }
+  if (e.code === 'Enter' && mode === 'map' && sel.size === 1) { takeControl([...sel][0]); setMode('drive'); }
+  if (e.code === 'KeyQ' && mode === 'map') { sel.clear(); for (const u of units) if (u.fac === 1 && !u.dead && u.def.speed) sel.add(u); }
+  if (e.code === 'KeyE' && mode === 'drive') { // hop into the nearest friendly unit ahead
+    let best = null, bd = 1e9; for (const u of units) { if (u.dead || u.fac !== 1 || u === ctrl) continue; const d = Math.hypot(u.x - ctrl.x, u.z - ctrl.z), a = Math.abs(angDiff(aimYaw, Math.atan2(u.x - ctrl.x, u.z - ctrl.z))); const sc = d * (1 + a * 2); if (sc < bd) { bd = sc; best = u; } }
+    if (best) takeControl(best);
+  }
+  const b = BUILDABLE.find(t => DEF[t].key === e.key); if (b) build(b);
+});
+addEventListener('keyup', e => keys[e.code] = 0);
+addEventListener('blur', () => { for (const k in keys) keys[k] = 0; });
+function build(t) { if (state !== 'play' || buildCool > 0) return; if (spawn(t, 1)) { buildCool = 0.35; say(DEF[t].name + ' assembled', CSS[1]); } }
+BUILDABLE.forEach(t => { const b = document.createElement('button'); b.dataset.t = t; b.innerHTML = '<b>' + DEF[t].key + '</b> ' + DEF[t].name + ' · ' + DEF[t].cost; b.onclick = () => build(t); $('bar').appendChild(b); });
+
+// ---------- HUD / overlay ----------
+function hud() {
+  const meter = (v, col) => '<span class="meter"><i style="width:' + clamp(v * 100, 0, 100) + '%;background:' + col + '"></i></span>';
+  $('tl').innerHTML = 'ENERGY <b style="color:#ffd76a">' + Math.floor(energy[1]) + '</b>  +' + income[1].toFixed(1) + '/s<br>' +
+    'SECTORS ' + income.n1 + ' · STATIONS ' + income.s1 + ' · GRID ' + Math.round(income.e1 * 100) + '%<br>' +
+    'FORCES ' + units.filter(u => u.fac === 1 && u.type !== 'hq').length + '/' + UNIT_CAP + ' · THEATRE ' + level;
+  const h1 = hq[1], h2 = hq[2];
+  $('tr').innerHTML = (ctrl ? 'CONTROL: ' + ctrl.def.name.toUpperCase() + ' ' + meter(ctrl.hp / ctrl.max, '#46e0a0') + '<br>' : '') +
+    'HOST STATION ' + meter(h1.hp / h1.max, '#27c6da') + '<br>ASHFALL HOST ' + meter(h2.hp / h2.max, '#f0603c') + '<br>ASHFALL SECTORS ' + income.n2;
+  $('help').textContent = mode === 'map'
+    ? 'MAP · click/drag select · right-click: move (Host Station: jump, ' + JUMP_COST + ' energy) · double-click or ENTER: drive unit · Q: select all · TAB: close'
+    : 'W/S drive · A/D or mouse turn · click or F fire' + (ctrl && ctrl.type === 'gunship' ? ' · SPACE/C climb/descend' : '') + ' · E hop to nearest unit · H Host Station · TAB map';
+  for (const b of $('bar').children) b.classList.toggle('no', energy[1] < DEF[b.dataset.t].cost);
+}
+function showOverlay(html) { $('ovbox').innerHTML = html; $('ov').style.display = 'flex'; }
+function advance() {
+  if (state === 'won') level++; else if (state === 'lost') level = 1;
+  genLevel(); state = 'play'; paused = false; $('ov').style.display = 'none'; setMode('drive');
+  say('Theatre ' + level + ': destroy the Ashfall Host Station');
+}
+$('ov').addEventListener('click', advance);
+showOverlay('<h1>GRID DOMINION</h1><h2>SECTOR WARFARE · COMMAND AND DRIVE</h2>' +
+  'You command a hovering <b>Host Station</b>. It turns energy into war machines, and you can take the controls of any of them.<br><br>' +
+  '• Park units in a sector (or shoot its buildings) to wear it down and <b>capture</b> it.<br>' +
+  '• <b>Power stations ⚡</b> feed your energy; each needs about seven sectors of grid to run at full output.<br>' +
+  '• Win by destroying the enemy Host Station. Lose yours and it is over.<br><br>' +
+  '<kbd>1-4</kbd> build · <kbd>TAB</kbd> command map · <kbd>W A S D</kbd> + mouse drive · <kbd>click</kbd>/<kbd>F</kbd> fire<br>' +
+  '<kbd>E</kbd> hop into nearest unit · <kbd>H</kbd> back to Host Station · <kbd>P</kbd> pause' +
+  '<div class="go">Click or press ENTER to deploy</div>');
+
+// ---------- loop ----------
+function step(dt) { if (state === 'play' && !paused) update(dt); else if (state !== 'play') { T += dt; if (state === 'title') { aimYaw += dt * 0.1; } } }
+let last = performance.now(), hudT = 0;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  step(dt); placeCamera(); renderer.render(scene, camera); drawMap();
+  hudT -= dt; if (hudT <= 0) { hudT = 0.15; hud(); }
+  requestAnimationFrame(frame);
+}
+genLevel(); requestAnimationFrame(frame);
+window.__g = { get units() { return units; }, get sectors() { return sectors; }, get energy() { return energy; }, get income() { return income; }, get state() { return state; }, get ctrl() { return ctrl; }, get hq() { return hq; }, get sel() { return sel; },
+  keys, step, advance, spawn, takeControl, setMode, orderTo, hurt, set aim(v) { aimYaw = v[0]; aimPitch = v[1]; } };
+})();
+</script>
+</body>
+</html>
