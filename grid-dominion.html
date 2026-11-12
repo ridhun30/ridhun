@@ -7,6 +7,7 @@
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #05080a; color: #c9f4ee;
     font: 13px ui-monospace, Menlo, Consolas, monospace; user-select: none; -webkit-user-select: none; }
+  #gl { image-rendering: pixelated; image-rendering: crisp-edges; }
   #gl, #map { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
   #map { pointer-events: none; }
   body.mapmode #map { pointer-events: auto; cursor: crosshair; }
@@ -71,25 +72,45 @@ const BUILDABLE = ['scout', 'tank', 'gunship', 'turret'];
 const UNIT_CAP = 30, JUMP_COST = 120;
 
 // ---------- three setup ----------
-const renderer = new THREE.WebGLRenderer({ canvas: $('gl'), antialias: true });
+const renderer = new THREE.WebGLRenderer({ canvas: $('gl'), antialias: false });
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x9fb6c4);
-scene.fog = new THREE.Fog(0x9fb6c4, 300, 1500);
+const FOGC = 0x3a424c;
+scene.background = new THREE.Color(FOGC);
+scene.fog = new THREE.Fog(FOGC, 140, 1150);
 const camera = new THREE.PerspectiveCamera(68, 1, 1, 3000);
 const mapCv = $('map'), m2 = mapCv.getContext('2d');
 function resize() {
   const dpr = Math.min(devicePixelRatio || 1, 2);
-  renderer.setPixelRatio(dpr); renderer.setSize(innerWidth, innerHeight, false);
+  const k = Math.min(1, 360 / innerHeight);   // chunky low-resolution 3D, scaled up without smoothing
+  renderer.setPixelRatio(1); renderer.setSize(Math.round(innerWidth * k), Math.round(innerHeight * k), false);
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
   mapCv.width = innerWidth * dpr; mapCv.height = innerHeight * dpr;
 }
 addEventListener('resize', resize); resize();
 const GEO = { box: new THREE.BoxGeometry(1, 1, 1), sph: new THREE.SphereGeometry(1, 12, 8), cyl: new THREE.CylinderGeometry(1, 1, 1, 12), tile: new THREE.PlaneGeometry(SS - 3, SS - 3) };
 GEO.tile.rotateX(-Math.PI / 2);
-const lam = c => new THREE.MeshLambertMaterial({ color: c });
+function tex(w, h, draw) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h; draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c); t.magFilter = THREE.NearestFilter; t.minFilter = THREE.NearestFilter; t.generateMipmaps = false; return t;
+}
+const TEX = {
+  ground: tex(64, 64, (c, w, h) => {
+    c.fillStyle = '#b4b4b4'; c.fillRect(0, 0, w, h);
+    for (let i = 0; i < 900; i++) { const v = 120 + Math.random() * 120 | 0; c.fillStyle = 'rgb(' + v + ',' + v + ',' + v + ')'; c.fillRect(Math.random() * w | 0, Math.random() * h | 0, 1 + Math.random() * 2 | 0, 1); }
+    c.fillStyle = '#5a5a5a'; c.fillRect(0, 0, w, 2); c.fillRect(0, 0, 2, h); c.fillRect(0, h - 2, w, 2); c.fillRect(w - 2, 0, 2, h);
+    c.fillStyle = '#8a8a8a'; c.fillRect(31, 2, 1, h - 4); c.fillRect(2, 31, w - 4, 1);
+  }),
+  wall: tex(32, 32, (c, w, h) => {
+    c.fillStyle = '#a8a8a8'; c.fillRect(0, 0, w, h);
+    for (let i = 0; i < 160; i++) { const v = 130 + Math.random() * 70 | 0; c.fillStyle = 'rgb(' + v + ',' + v + ',' + v + ')'; c.fillRect(Math.random() * w | 0, Math.random() * h | 0, 2, 1); }
+    for (let y = 3; y < h - 3; y += 6) for (let x = 3; x < w - 3; x += 5) { c.fillStyle = Math.random() < 0.3 ? '#ffe9a8' : '#3c4046'; c.fillRect(x, y, 3, 3); }
+    c.fillStyle = '#6a6a6a'; c.fillRect(0, 0, w, 1); c.fillRect(0, h - 1, w, 1);
+  })
+};
+const lam = (c, map) => new THREE.MeshLambertMaterial({ color: c, map: map || null });
 const MAT = {
   hull: [null, lam(0x3f7f8c), lam(0x8c4a3a)], trim: [null, lam(0x1fb6c9), lam(0xe0512f)], dark: lam(0x23282a),
-  bld: [lam(0x8e948b), lam(0x7fa5aa), lam(0xab8377)], glow: COL.map(c => new THREE.MeshBasicMaterial({ color: c })),
+  bld: [lam(0xa0a69c, TEX.wall), lam(0x86c0c8, TEX.wall), lam(0xd0937f, TEX.wall)], glow: COL.map(c => new THREE.MeshBasicMaterial({ color: c })),
   shot: [null, new THREE.MeshBasicMaterial({ color: 0x8ff6ff }), new THREE.MeshBasicMaterial({ color: 0xffb070 })],
   rotor: new THREE.MeshBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.35 })
 };
@@ -118,8 +139,46 @@ function unitMesh(type, f) {
   return g;
 }
 
+// ---------- audio ----------
+let ac = null, master = null, noiseBuf = null, muted = false, sndN = 0;
+function audioInit() {
+  if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+  try {
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    master = ac.createGain(); master.gain.value = 0.6; master.connect(ac.destination);
+    noiseBuf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    // brooding drone: detuned low saws through a slowly breathing filter
+    const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 170; f.Q.value = 4;
+    const g = ac.createGain(); g.gain.value = 0.09; f.connect(g); g.connect(master);
+    for (const hz of [41.2, 41.5, 61.9, 82.1]) { const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = hz; o.connect(f); o.start(); }
+    const lfo = ac.createOscillator(), lg = ac.createGain(); lfo.frequency.value = 0.07; lg.gain.value = 70; lfo.connect(lg); lg.connect(f.frequency); lfo.start();
+    // wind
+    const w = ac.createBufferSource(); w.buffer = noiseBuf; w.loop = true;
+    const wf = ac.createBiquadFilter(); wf.type = 'bandpass'; wf.frequency.value = 380; wf.Q.value = 0.7;
+    const wg = ac.createGain(); wg.gain.value = 0.035; w.connect(wf); wf.connect(wg); wg.connect(master); w.start();
+    const wl = ac.createOscillator(), wlg = ac.createGain(); wl.frequency.value = 0.11; wlg.gain.value = 180; wl.connect(wlg); wlg.connect(wf.frequency); wl.start();
+  } catch (e) { ac = null; }
+}
+function sNoise(dur, freq, vol) {
+  if (!ac || vol < 0.02 || sndN > 10) return; sndN++; setTimeout(() => sndN--, dur * 600);
+  const t = ac.currentTime, src = ac.createBufferSource(); src.buffer = noiseBuf;
+  const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.setValueAtTime(freq, t); f.frequency.exponentialRampToValueAtTime(Math.max(50, freq * 0.15), t + dur);
+  const g = ac.createGain(); g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  src.connect(f); f.connect(g); g.connect(master); src.start(t, Math.random(), dur + 0.05);
+}
+function sTone(a, b, dur, vol, type) {
+  if (!ac || vol < 0.02) return;
+  const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain(); o.type = type || 'square';
+  o.frequency.setValueAtTime(a, t); o.frequency.exponentialRampToValueAtTime(b, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur); o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + 0.02);
+}
+const nearVol = (x, y, z) => { const c = camera.position; return clamp(1 - Math.hypot(x - c.x, y - c.y, z - c.z) / 520, 0, 1) ** 2; };
+addEventListener('keydown', e => { audioInit(); if (e.code === 'KeyN' && master) { muted = !muted; master.gain.value = muted ? 0 : 0.6; } });
+addEventListener('mousedown', audioInit);
+
 // ---------- state ----------
-let G = 9, WS = G * SS, level = 1, sectors = [], units = [], shots = [], booms = [];
+let dome = null, G = 9, WS = G * SS, level = 1, sectors = [], units = [], shots = [], booms = [];
 let energy = [0, 0, 0], income = [0, 0, 0], hq = [null, null, null];
 let ctrl = null, aimYaw = 0, aimPitch = 0, mode = 'drive', state = 'title', paused = false, T = 0;
 let sel = new Set(), tick = 0, aiT = 0, buildCool = 0, drag = null;
@@ -127,6 +186,7 @@ const keys = {};
 const secAt = (x, z) => sectors[clamp(Math.floor(z / SS), 0, G - 1) * G + clamp(Math.floor(x / SS), 0, G - 1)];
 
 function say(t, col) {
+  sTone(col === CSS[2] ? 300 : 620, col === CSS[2] ? 180 : 880, 0.14, 0.07, 'triangle');
   const d = document.createElement('div'); d.textContent = t; if (col) d.style.color = col; $('log').prepend(d);
   while ($('log').children.length > 4) $('log').lastChild.remove();
   setTimeout(() => d.style.opacity = 0, 3500); setTimeout(() => d.remove(), 4200);
@@ -134,12 +194,17 @@ function say(t, col) {
 
 function genLevel() {
   while (scene.children.length) scene.remove(scene.children[0]);
-  scene.add(new THREE.HemisphereLight(0xdfeeff, 0x4a5540, 0.95));
-  const sun = new THREE.DirectionalLight(0xfff2d8, 0.75); sun.position.set(0.5, 1, 0.3); scene.add(sun);
+  scene.add(new THREE.HemisphereLight(0x9db4cc, 0x2c2822, 0.85));
+  const sun = new THREE.DirectionalLight(0xffc48a, 0.7); sun.position.set(0.8, 0.45, 0.25); scene.add(sun);
+  // dusk sky dome: haze at the horizon, a dull ember band, night overhead
+  const dg = new THREE.SphereGeometry(2400, 24, 12), dc = [], pos = dg.attributes.position, A = new THREE.Color(FOGC), B = new THREE.Color(0x7a4a3a), C = new THREE.Color(0x0b1020), tmp = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) { const t = clamp(pos.getY(i) / 2400, 0, 1); if (t < 0.12) tmp.copy(A).lerp(B, t / 0.12 * 0.55); else tmp.copy(A).lerp(B, 0.55).lerp(C, Math.min(1, (t - 0.12) / 0.45)); dc.push(tmp.r, tmp.g, tmp.b); }
+  dg.setAttribute('color', new THREE.Float32BufferAttribute(dc, 3));
+  dome = new THREE.Mesh(dg, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false })); dome.renderOrder = -1; scene.add(dome);
   G = Math.min(8 + level, 13); WS = G * SS;
   const r = rng(level * 9173 + 5);
   sectors = []; units = []; shots = []; booms = []; sel = new Set();
-  const under = new THREE.Mesh(new THREE.PlaneGeometry(WS + 4000, WS + 4000), lam(0x2c3330)); under.rotation.x = -Math.PI / 2; under.position.set(WS / 2, -0.6, WS / 2); scene.add(under);
+  const under = new THREE.Mesh(new THREE.PlaneGeometry(WS + 4000, WS + 4000), lam(0x2b3238)); under.rotation.x = -Math.PI / 2; under.position.set(WS / 2, -0.6, WS / 2); scene.add(under);
   // stations: mirrored so both sides get the same chances
   const st = new Set([1 * G + 2, (G - 2) * G + (G - 3)]);
   let guard = 0;
@@ -151,7 +216,7 @@ function genLevel() {
   for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) {
     const owner = (i < 3 && j < 3) ? 1 : (i > G - 4 && j > G - 4) ? 2 : 0;
     const s = { i, j, cx: (i + 0.5) * SS, cz: (j + 0.5) * SS, owner, hp: owner ? 100 : 60, station: st.has(j * G + i), blds: [], cnt: [0, 0, 0], shade: 0.82 + r() * 0.3 };
-    s.tile = new THREE.Mesh(GEO.tile, lam(0xffffff)); s.tile.position.set(s.cx, 0, s.cz); scene.add(s.tile);
+    s.tile = new THREE.Mesh(GEO.tile, lam(0xffffff, TEX.ground)); s.tile.position.set(s.cx, 0, s.cz); scene.add(s.tile);
     const isHQ = (i === 1 && j === 1) || (i === G - 2 && j === G - 2);
     if (s.station) {
       const g = new THREE.Group(); g.position.set(s.cx, 0, s.cz);
@@ -180,7 +245,7 @@ function genLevel() {
 }
 
 function paint(s) {
-  const c = new THREE.Color(COL[s.owner]).multiplyScalar(s.owner ? 0.42 : 0.5).lerp(new THREE.Color(0x56634c), s.owner ? 0.35 : 0.6).multiplyScalar(s.shade);
+  const c = new THREE.Color(COL[s.owner]).multiplyScalar(s.owner ? 0.6 : 0.62).lerp(new THREE.Color(0x6a705c), s.owner ? 0.35 : 0.65).multiplyScalar(s.shade);
   s.tile.material.color.copy(c);
   for (const b of s.blds) if (b.mesh) b.mesh.material = MAT.bld[s.owner];
   if (s.orb) s.orb.material = MAT.glow[s.owner];
@@ -221,6 +286,7 @@ function spawn(type, f, free) {
 function boom(x, y, z, size, color) {
   const m = new THREE.Mesh(GEO.sph, new THREE.MeshBasicMaterial({ color: color || 0xffc070, transparent: true }));
   m.position.set(x, y, z); scene.add(m); booms.push({ m, t: 0, size, life: 0.25 + size * 0.02 });
+  if (size > 5) sNoise(0.35 + size * 0.02, 700, nearVol(x, y, z) * Math.min(0.7, 0.2 + size * 0.02));
 }
 
 function fire(u, dx, dy, dz, mult, far) {
@@ -230,6 +296,8 @@ function fire(u, dx, dy, dz, mult, far) {
   const s = { x: u.x + dx * (d.r + 3), y: my, z: u.z + dz * (d.r + 3), vx: dx * sp, vy: dy * sp, vz: dz * sp, life: d.range * (far || 1.2) / sp, dmg: d.dmg * (mult || 1), fac: u.fac, m };
   m.position.set(s.x, s.y, s.z); m.lookAt(s.x + dx, s.y + dy, s.z + dz); scene.add(m); shots.push(s);
   u.cool = d.rof;
+  const v = u === ctrl ? 0.22 : nearVol(u.x, u.y, u.z) * 0.14;
+  if (d.dmg > 18) sNoise(0.3, 900, v * 1.6); else sTone(u.fac === 1 ? 950 : 700, 160, 0.09, v * 0.6, 'sawtooth');
 }
 function hurt(u, d) {
   if (u.dead) return;
@@ -420,6 +488,7 @@ function placeCamera() {
   const u = ctrl; if (!u) return;
   const back = u.type === 'hq' ? 78 : u.type === "gunship" ? 26 : 25, up = u.type === "hq" ? 26 : 9, d = aimDir();
   camera.position.set(u.x - Math.sin(aimYaw) * back, Math.max(2.5, u.y + up - d.y * back * 0.6), u.z - Math.cos(aimYaw) * back);
+  if (dome) dome.position.set(camera.position.x, -40, camera.position.z);
   camera.lookAt(camera.position.x + d.x * 100, camera.position.y + d.y * 100, camera.position.z + d.z * 100);
 }
 function takeControl(u) {
@@ -558,7 +627,7 @@ showOverlay('<h1>GRID DOMINION</h1><h2>SECTOR WARFARE · COMMAND AND DRIVE</h2>'
   '• <b>Power stations ⚡</b> feed your energy; each needs about seven sectors of grid to run at full output.<br>' +
   '• Win by destroying the enemy Host Station. Lose yours and it is over.<br><br>' +
   '<kbd>1-4</kbd> build · <kbd>TAB</kbd> command map · <kbd>W A S D</kbd> + mouse drive · <kbd>click</kbd>/<kbd>F</kbd> fire<br>' +
-  '<kbd>E</kbd> hop into nearest unit · <kbd>H</kbd> back to Host Station · <kbd>P</kbd> pause' +
+  '<kbd>E</kbd> hop into nearest unit · <kbd>H</kbd> back to Host Station · <kbd>P</kbd> pause · <kbd>N</kbd> mute' +
   '<div class="go">Click or press ENTER to deploy</div>');
 
 // ---------- loop ----------
